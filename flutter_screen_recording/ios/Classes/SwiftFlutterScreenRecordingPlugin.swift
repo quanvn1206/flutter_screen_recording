@@ -11,8 +11,20 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
     var audioWriterInput: AVAssetWriterInput?
     var videoOutputURL: URL?
     var isRecording = false
-    var firstTimestamp: CMTime? 
+    var firstTimestamp: CMTime?
     let screenSize = UIScreen.main.bounds
+
+    // ReplayKit invokes the `startCapture` handler for video and audio
+    // sample buffers concurrently, on two separate internal queues. All
+    // reads/writes of the writer/session state below must go through this
+    // queue, or the audio queue can observe `videoWriter.status == .writing`
+    // (set synchronously inside `startWriting()`) in the brief window before
+    // `startSession(atSourceTime:)` has actually run on the video queue —
+    // and then crash appending a sample buffer with "Must start a session
+    // ... first". `sessionStarted` (not `writer.status`) is the gate because
+    // it is only ever flipped true after `startSession` has actually returned.
+    private let writerQueue = DispatchQueue(label: "com.flutter_screen_recording.writer")
+    private var sessionStarted = false
     
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "flutter_screen_recording", binaryMessenger: registrar.messenger())
@@ -44,7 +56,8 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
         }
         
         isRecording = true
-        
+        writerQueue.sync { sessionStarted = false }
+
         // Configurar la ruta del archivo de video
         let documentsPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0]
         videoOutputURL = URL(fileURLWithPath: documentsPath).appendingPathComponent("\(videoName).mp4")
@@ -114,26 +127,32 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
     }
     
     func handleVideoBuffer(_ sampleBuffer: CMSampleBuffer) {
-        // Añadir el video al archivo
-        guard let writer = videoWriter, let input = videoWriterInput else { return }
-        
-        if writer.status == .unknown {
-            firstTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            writer.startWriting()
-            writer.startSession(atSourceTime: firstTimestamp!)
-        }
-        
-        if writer.status == .writing && input.isReadyForMoreMediaData {
-            input.append(sampleBuffer)
+        writerQueue.sync {
+            // Añadir el video al archivo
+            guard let writer = videoWriter, let input = videoWriterInput else { return }
+
+            if !sessionStarted {
+                firstTimestamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+                writer.startWriting()
+                writer.startSession(atSourceTime: firstTimestamp!)
+                sessionStarted = true
+            }
+
+            if writer.status == .writing && input.isReadyForMoreMediaData {
+                input.append(sampleBuffer)
+            }
         }
     }
-    
+
     func handleAudioBuffer(_ sampleBuffer: CMSampleBuffer) {
-        // Añadir el audio al video
-        guard let writer = videoWriter, let input = audioWriterInput else { return }
-        
-        if writer.status == .writing && input.isReadyForMoreMediaData {
-            input.append(sampleBuffer)
+        writerQueue.sync {
+            // Añadir el audio al video — solo despues de que la sesion de
+            // video haya arrancado realmente (ver comentario en sessionStarted).
+            guard let writer = videoWriter, let input = audioWriterInput, sessionStarted else { return }
+
+            if writer.status == .writing && input.isReadyForMoreMediaData {
+                input.append(sampleBuffer)
+            }
         }
     }
     
