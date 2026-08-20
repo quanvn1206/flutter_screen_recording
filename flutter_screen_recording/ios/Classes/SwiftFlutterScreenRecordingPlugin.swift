@@ -8,7 +8,8 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
     let recorder = RPScreenRecorder.shared()
     var videoWriter: AVAssetWriter?
     var videoWriterInput: AVAssetWriterInput?
-    var audioWriterInput: AVAssetWriterInput?
+    var appAudioWriterInput: AVAssetWriterInput?
+    var micAudioWriterInput: AVAssetWriterInput?
     var videoOutputURL: URL?
     var isRecording = false
     var firstTimestamp: CMTime?
@@ -93,9 +94,13 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                     AVSampleRateKey: 44100,
                     AVNumberOfChannelsKey: 2
                 ]
-                audioWriterInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-                audioWriterInput?.expectsMediaDataInRealTime = true
-                videoWriter?.add(audioWriterInput!)
+                appAudioWriterInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+                appAudioWriterInput?.expectsMediaDataInRealTime = true
+                videoWriter?.add(appAudioWriterInput!)
+
+                micAudioWriterInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+                micAudioWriterInput?.expectsMediaDataInRealTime = true
+                videoWriter?.add(micAudioWriterInput!)
             }
             
             // Iniciar la captura con ReplayKit
@@ -106,11 +111,15 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                 switch sampleBufferType {
                 case .video:
                     self.handleVideoBuffer(sampleBuffer)
+                case .audioApp:
+                    if recordAudio {
+                        self.handleAudioBuffer(sampleBuffer, input: self.appAudioWriterInput)
+                    }
                 case .audioMic:
                     if recordAudio {
-                        self.handleAudioBuffer(sampleBuffer)
+                        self.handleAudioBuffer(sampleBuffer, input: self.micAudioWriterInput)
                     }
-                default:
+                @unknown default:
                     break
                 }
             }) { error in
@@ -144,11 +153,12 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
         }
     }
 
-    func handleAudioBuffer(_ sampleBuffer: CMSampleBuffer) {
+    func handleAudioBuffer(_ sampleBuffer: CMSampleBuffer, input: AVAssetWriterInput?) {
         writerQueue.sync {
-            // Añadir el audio al video — solo despues de que la sesion de
-            // video haya arrancado realmente (ver comentario en sessionStarted).
-            guard let writer = videoWriter, let input = audioWriterInput, sessionStarted else { return }
+            // Each ReplayKit audio source has its own AVAssetWriter track. The
+            // streams arrive independently and must not be appended to one
+            // shared input as if they were a single chronological stream.
+            guard let writer = videoWriter, let input, sessionStarted else { return }
 
             if writer.status == .writing && input.isReadyForMoreMediaData {
                 input.append(sampleBuffer)
@@ -168,7 +178,8 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                 guard let self = self else { return }
                 
                 self.videoWriterInput?.markAsFinished()
-                self.audioWriterInput?.markAsFinished()
+                self.appAudioWriterInput?.markAsFinished()
+                self.micAudioWriterInput?.markAsFinished()
                 self.videoWriter?.finishWriting {
                     if let error = error {
                         result(FlutterError(code: "STOP_ERROR", message: "Failed to stop recording", details: error.localizedDescription))

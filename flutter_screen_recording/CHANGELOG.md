@@ -1,3 +1,7 @@
+## 2.0.25
+
+- Capture ReplayKit app audio and microphone audio as separate tracks on iOS.
+
 ## 2.0.24
 
 - Refactor
