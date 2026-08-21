@@ -14,12 +14,22 @@ void main() {
     '$packageRoot/android/src/main/kotlin/com/isvisoft/flutter_screen_recording/FlutterScreenRecordingPlugin.kt',
   ).readAsStringSync();
 
-  test('declares a mediaProjection foreground service', () {
+  test('declares only the permissions required for recording', () {
+    expect(manifest, contains('android.permission.FOREGROUND_SERVICE'));
     expect(
       manifest,
       contains('android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION'),
     );
     expect(manifest, contains('android:foregroundServiceType="mediaProjection"'));
+    expect(manifest, contains('android:exported="false"'));
+    expect(manifest, isNot(contains('android.permission.SYSTEM_ALERT_WINDOW')));
+    expect(manifest, isNot(contains('android.permission.WAKE_LOCK')));
+    expect(manifest, isNot(contains('android.permission.RECEIVE_BOOT_COMPLETED')));
+  });
+
+  test('does not package an unused second screen recorder', () {
+    final gradle = File('$packageRoot/android/build.gradle').readAsStringSync();
+    expect(gradle, isNot(contains('HBRecorder')));
   });
 
   test('does not request foreground-service permission from the service', () {
