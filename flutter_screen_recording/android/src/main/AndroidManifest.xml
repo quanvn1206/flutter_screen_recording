@@ -7,6 +7,9 @@
 	<uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 	<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 	<application>
-		<service android:name=".ForegroundService" android:foregroundServiceType="mediaProjection" />
+		<service
+			android:name=".ForegroundService"
+			android:exported="false"
+			android:foregroundServiceType="mediaProjection" />
 	</application>
 </manifest>
