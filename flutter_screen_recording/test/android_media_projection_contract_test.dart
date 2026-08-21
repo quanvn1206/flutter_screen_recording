@@ -27,9 +27,11 @@ void main() {
     expect(manifest, isNot(contains('android.permission.RECEIVE_BOOT_COMPLETED')));
   });
 
-  test('does not package an unused second screen recorder', () {
+  test('does not package unused background service dependencies', () {
     final gradle = File('$packageRoot/android/build.gradle').readAsStringSync();
+    final pubspec = File('$packageRoot/pubspec.yaml').readAsStringSync();
     expect(gradle, isNot(contains('HBRecorder')));
+    expect(pubspec, isNot(contains('flutter_foreground_task')));
   });
 
   test('does not request foreground-service permission from the service', () {
