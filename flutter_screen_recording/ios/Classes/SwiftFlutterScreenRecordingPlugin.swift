@@ -2,9 +2,21 @@ import Flutter
 import UIKit
 import ReplayKit
 import AVFoundation
+import AudioToolbox
 
 public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
-    
+
+    // `RPScreenRecorder`'s `.audioMic` samples arrive far quieter than the
+    // `.audioApp` samples for the same recording — a well-documented
+    // ReplayKit behavior (no app-side input gain control is exposed), not a
+    // bug specific to this fork. Since both tracks get mixed together at
+    // playback, an un-boosted mic track reads as "almost inaudible" next to
+    // narration/SFX. These factors are empirical starting points — tune by
+    // ear on a real device (the simulator's mic capture isn't
+    // representative) if voice still needs adjusting.
+    private let micGainFactor: Float = 3.0
+    private let appAudioGainFactor: Float = 0.7
+
     let recorder = RPScreenRecorder.shared()
     var videoWriter: AVAssetWriter?
     var videoWriterInput: AVAssetWriterInput?
@@ -113,11 +125,11 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                     self.handleVideoBuffer(sampleBuffer)
                 case .audioApp:
                     if recordAudio {
-                        self.handleAudioBuffer(sampleBuffer, input: self.appAudioWriterInput)
+                        self.handleAudioBuffer(sampleBuffer, input: self.appAudioWriterInput, gain: self.appAudioGainFactor)
                     }
                 case .audioMic:
                     if recordAudio {
-                        self.handleAudioBuffer(sampleBuffer, input: self.micAudioWriterInput)
+                        self.handleAudioBuffer(sampleBuffer, input: self.micAudioWriterInput, gain: self.micGainFactor)
                     }
                 @unknown default:
                     break
@@ -153,7 +165,7 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
         }
     }
 
-    func handleAudioBuffer(_ sampleBuffer: CMSampleBuffer, input: AVAssetWriterInput?) {
+    func handleAudioBuffer(_ sampleBuffer: CMSampleBuffer, input: AVAssetWriterInput?, gain: Float) {
         writerQueue.sync {
             // Each ReplayKit audio source has its own AVAssetWriter track. The
             // streams arrive independently and must not be appended to one
@@ -161,9 +173,64 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
             guard let writer = videoWriter, let input, sessionStarted else { return }
 
             if writer.status == .writing && input.isReadyForMoreMediaData {
-                input.append(sampleBuffer)
+                input.append(adjustGain(of: sampleBuffer, factor: gain))
             }
         }
+    }
+
+    // Scales the PCM samples backing `sampleBuffer` in place by `factor`,
+    // clamped to the format's representable range to avoid clipping
+    // artifacts. ReplayKit hands each capture handler invocation a buffer
+    // that isn't referenced anywhere else afterward, so in-place mutation is
+    // safe. Falls back to returning the buffer untouched (rather than
+    // crashing) for any format/layout this doesn't recognize — losing the
+    // gain adjustment is far preferable to losing the recording.
+    private func adjustGain(of sampleBuffer: CMSampleBuffer, factor: Float) -> CMSampleBuffer {
+        guard factor != 1.0,
+              let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbdPointer = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription),
+              asbdPointer.pointee.mFormatID == kAudioFormatLinearPCM,
+              let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer),
+              CMBlockBufferIsRangeContiguous(blockBuffer, atOffset: 0, length: 0)
+        else {
+            return sampleBuffer
+        }
+
+        let asbd = asbdPointer.pointee
+        var lengthAtOffset = 0
+        var totalLength = 0
+        var dataPointer: UnsafeMutablePointer<Int8>?
+        let status = CMBlockBufferGetDataPointer(
+            blockBuffer,
+            atOffset: 0,
+            lengthAtOffsetOut: &lengthAtOffset,
+            totalLengthOut: &totalLength,
+            dataPointerOut: &dataPointer
+        )
+        guard status == kCMBlockBufferNoErr, let dataPointer else { return sampleBuffer }
+
+        let isFloat = asbd.mFormatFlags & kAudioFormatFlagIsFloat != 0
+        switch (isFloat, asbd.mBitsPerChannel) {
+        case (true, 32):
+            let sampleCount = totalLength / MemoryLayout<Float32>.size
+            dataPointer.withMemoryRebound(to: Float32.self, capacity: sampleCount) { samples in
+                for i in 0..<sampleCount {
+                    samples[i] = max(-1.0, min(1.0, samples[i] * factor))
+                }
+            }
+        case (false, 16):
+            let sampleCount = totalLength / MemoryLayout<Int16>.size
+            dataPointer.withMemoryRebound(to: Int16.self, capacity: sampleCount) { samples in
+                for i in 0..<sampleCount {
+                    let scaled = Float(samples[i]) * factor
+                    samples[i] = Int16(max(Float(Int16.min), min(Float(Int16.max), scaled)))
+                }
+            }
+        default:
+            break
+        }
+
+        return sampleBuffer
     }
     
     func stopRecording(result: @escaping FlutterResult) {
