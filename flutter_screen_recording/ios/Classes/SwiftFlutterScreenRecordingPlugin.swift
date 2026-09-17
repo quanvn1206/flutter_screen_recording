@@ -246,9 +246,12 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                     if let error = error {
                         result(FlutterError(code: "STOP_ERROR", message: "Failed to stop recording", details: error.localizedDescription))
                     } else {
-                        let alertController = UIAlertController(title: "Your video was successfully saved", message: nil, preferredStyle: .alert)
-                        let defaultAction = UIAlertAction(title: "OK", style: .default, handler: nil)
-                        alertController.addAction(defaultAction)
+                        // `AVAssetWriter.finishWriting`'s completion runs on an internal
+                        // background queue, not the main thread. This used to construct
+                        // (never present — dead code) a UIAlertController here, which
+                        // touches UIKit off the main thread and trips the Main Thread
+                        // Checker: "Modifying properties of a view's layer off the main
+                        // thread is not allowed." Just removed — nothing used the alert.
                         result(self.videoOutputURL?.path)
                     }
                 }
