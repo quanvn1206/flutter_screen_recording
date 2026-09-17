@@ -38,10 +38,56 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
     private var micAudioAppendFailureCount = 0
     private var loggedAppAudioFormat = false
     private var loggedMicAudioFormat = false
+    // Peak absolute sample value seen on the mic track this recording.
+    // Buffer/byte counts alone can't tell real audio apart from well-formed
+    // silence (silence still produces identically-sized buffers) — this is
+    // the read-only check for that. 0 means the hardware delivered silence
+    // (a mic/OS-level problem, e.g. a conflict with the camera pipeline also
+    // claiming the microphone); a normal talking voice should peak well into
+    // the thousands (Int16 range is ±32767).
+    private var micPeakAmplitude: Int16 = 0
 
     private func sampleByteLength(_ sampleBuffer: CMSampleBuffer) -> Int {
         guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return 0 }
         return CMBlockBufferGetDataLength(blockBuffer)
+    }
+
+    // Read-only — never mutates the buffer, so this cannot introduce the
+    // kind of corruption the earlier in-place gain-scaling attempt did.
+    // Assumes native-endian, packed Int16 mono, matching the confirmed
+    // audioMic format (formatFlags=12 → signedInteger+packed, no float, no
+    // big-endian bit). Silently no-ops for any other format.
+    private func updateMicPeakAmplitude(_ sampleBuffer: CMSampleBuffer) {
+        guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee,
+              asbd.mFormatID == kAudioFormatLinearPCM,
+              asbd.mFormatFlags & kAudioFormatFlagIsFloat == 0,
+              asbd.mBitsPerChannel == 16,
+              let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer),
+              CMBlockBufferIsRangeContiguous(blockBuffer, atOffset: 0, length: 0)
+        else { return }
+
+        var lengthAtOffset = 0
+        var totalLength = 0
+        var dataPointer: UnsafeMutablePointer<Int8>?
+        let status = CMBlockBufferGetDataPointer(
+            blockBuffer,
+            atOffset: 0,
+            lengthAtOffsetOut: &lengthAtOffset,
+            totalLengthOut: &totalLength,
+            dataPointerOut: &dataPointer
+        )
+        guard status == kCMBlockBufferNoErr, let dataPointer else { return }
+
+        let sampleCount = totalLength / MemoryLayout<Int16>.size
+        dataPointer.withMemoryRebound(to: Int16.self, capacity: sampleCount) { samples in
+            for i in 0..<sampleCount {
+                let magnitude = samples[i] == Int16.min ? Int16.max : abs(samples[i])
+                if magnitude > micPeakAmplitude {
+                    micPeakAmplitude = magnitude
+                }
+            }
+        }
     }
 
     private func permissionDescription(_ permission: AVAudioSession.RecordPermission) -> String {
@@ -147,6 +193,7 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
             micAudioAppendFailureCount = 0
             loggedAppAudioFormat = false
             loggedMicAudioFormat = false
+            micPeakAmplitude = 0
             if recordAudio {
                 let session = AVAudioSession.sharedInstance()
                 print("[flutter_screen_recording][diag] starting capture: recordPermission=\(permissionDescription(session.recordPermission)) category=\(session.category.rawValue) isInputAvailable=\(session.isInputAvailable) isMicrophoneEnabled=\(recorder.isMicrophoneEnabled)")
@@ -169,6 +216,7 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                         self.logAudioFormatOnce(sampleBuffer, label: "audioMic", logged: &self.loggedMicAudioFormat)
                         self.micAudioBufferCount += 1
                         self.micAudioByteTotal += self.sampleByteLength(sampleBuffer)
+                        self.updateMicPeakAmplitude(sampleBuffer)
                         if self.micAudioBufferCount % 50 == 0 {
                             print("[flutter_screen_recording][diag] mic buffers so far=\(self.micAudioBufferCount) bytes=\(self.micAudioByteTotal) appendFailures=\(self.micAudioAppendFailureCount)")
                         }
@@ -234,7 +282,7 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
             return
         }
         isRecording = false
-        print("[flutter_screen_recording][diag] stopping capture: appAudioBuffers=\(appAudioBufferCount) bytes=\(appAudioByteTotal) | micAudioBuffers=\(micAudioBufferCount) bytes=\(micAudioByteTotal) micAppendFailures=\(micAudioAppendFailureCount)")
+        print("[flutter_screen_recording][diag] stopping capture: appAudioBuffers=\(appAudioBufferCount) bytes=\(appAudioByteTotal) | micAudioBuffers=\(micAudioBufferCount) bytes=\(micAudioByteTotal) micAppendFailures=\(micAudioAppendFailureCount) | micPeakAmplitude=\(micPeakAmplitude) (0=silence, ~1000s+=real speech)")
         if #available(iOS 11.0, *) {
             recorder.stopCapture { [weak self] error in
                 guard let self = self else { return }

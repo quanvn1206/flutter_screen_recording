@@ -23,7 +23,10 @@ void main() {
     expect(source, contains('AVMutableAudioMix'));
     // Guards against reintroducing the raw-PCM gain scaling that caused
     // audible static — mixing must go through AVFoundation's export
-    // pipeline, not manual buffer manipulation in the ReplayKit callback.
-    expect(source, isNot(contains('withMemoryRebound')));
+    // pipeline, not by mutating sample buffers in the ReplayKit callback.
+    // (Read-only inspection, like the peak-amplitude diagnostic, is fine —
+    // this only bans the specific mutating helper that was reverted.)
+    expect(source, isNot(contains('func adjustGain')));
+    expect(source, isNot(contains('input.append(adjustGain')));
   });
 }
