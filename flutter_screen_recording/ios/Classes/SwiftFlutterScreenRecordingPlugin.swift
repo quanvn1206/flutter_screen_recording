@@ -45,13 +45,23 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
         return CMBlockBufferGetDataLength(blockBuffer)
     }
 
-    // Read-only — never mutates the buffer, so this cannot introduce the
-    // kind of corruption an earlier gain-scaling attempt did (see git
-    // history: raw PCM buffer mutation caused audible static and was
-    // reverted). Assumes native-endian, packed Int16 mono, matching the
-    // confirmed audioMic format (formatFlags=12 → signedInteger+packed, no
-    // float, no big-endian bit). Silently no-ops for any other format.
-    private func updateMicPeakAmplitude(_ sampleBuffer: CMSampleBuffer) {
+    // Modest, fixed digital gain applied to the mic samples in place before
+    // they're appended to the writer. An earlier gain-scaling attempt (see
+    // git history) corrupted audio, but that was scaling *two* tracks with
+    // mismatched sample formats (mic native-endian, app audio big-endian);
+    // there is only the one, confirmed-format mic track now. Kept modest
+    // (not the earlier 3.0x) because on-device diagnostics already showed
+    // peaks reaching ~93% of full scale (30496/32767) — a strong multiplier
+    // would clip the loudest moments. This still raises perceived loudness
+    // on the much-more-common quieter passages, at the cost of mildly
+    // flattening (not corrupting) the rare loudest peaks.
+    private let micGainFactor: Float = 1.6
+
+    // Assumes native-endian, packed Int16 mono, matching the confirmed
+    // audioMic format (formatFlags=12 → signedInteger+packed, no float, no
+    // big-endian bit). Silently no-ops (no gain applied) for any other
+    // format, rather than guessing and risking corruption.
+    private func applyMicGain(_ sampleBuffer: CMSampleBuffer) {
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee,
               asbd.mFormatID == kAudioFormatLinearPCM,
@@ -76,6 +86,10 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
         let sampleCount = totalLength / MemoryLayout<Int16>.size
         dataPointer.withMemoryRebound(to: Int16.self, capacity: sampleCount) { samples in
             for i in 0..<sampleCount {
+                let scaled = Float(samples[i]) * micGainFactor
+                let clamped = max(Float(Int16.min), min(Float(Int16.max), scaled))
+                samples[i] = Int16(clamped)
+
                 let magnitude = samples[i] == Int16.min ? Int16.max : abs(samples[i])
                 if magnitude > micPeakAmplitude {
                     micPeakAmplitude = magnitude
@@ -259,7 +273,7 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                         self.logAudioFormatOnce(sampleBuffer, label: "audioMic", logged: &self.loggedMicAudioFormat)
                         self.micAudioBufferCount += 1
                         self.micAudioByteTotal += self.sampleByteLength(sampleBuffer)
-                        self.updateMicPeakAmplitude(sampleBuffer)
+                        self.applyMicGain(sampleBuffer)
                         if self.micAudioBufferCount % 50 == 0 {
                             print("[flutter_screen_recording][diag] mic buffers so far=\(self.micAudioBufferCount) bytes=\(self.micAudioByteTotal) appendFailures=\(self.micAudioAppendFailureCount)")
                         }
@@ -322,7 +336,7 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
             return
         }
         isRecording = false
-        print("[flutter_screen_recording][diag] stopping capture: micAudioBuffers=\(micAudioBufferCount) bytes=\(micAudioByteTotal) micAppendFailures=\(micAudioAppendFailureCount) micPeakAmplitude=\(micPeakAmplitude) (0=silence, ~1000s+=real speech)")
+        print("[flutter_screen_recording][diag] stopping capture: micAudioBuffers=\(micAudioBufferCount) bytes=\(micAudioByteTotal) micAppendFailures=\(micAudioAppendFailureCount) micPeakAmplitude=\(micPeakAmplitude) post-gain (gain=\(micGainFactor)x, 32767=clipping ceiling)")
         if #available(iOS 11.0, *) {
             recorder.stopCapture { [weak self] error in
                 guard let self = self else { return }
