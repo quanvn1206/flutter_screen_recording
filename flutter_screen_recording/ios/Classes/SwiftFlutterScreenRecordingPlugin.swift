@@ -26,7 +26,42 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
     // it is only ever flipped true after `startSession` has actually returned.
     private let writerQueue = DispatchQueue(label: "com.flutter_screen_recording.writer")
     private var sessionStarted = false
-    
+
+    // TEMPORARY diagnostics for the "no mic audio" investigation. Printed
+    // via `print()` so it shows up directly in `flutter run`'s console — no
+    // Xcode attach needed. Safe to leave in (cheap counters, no behavior
+    // change); remove once the mic issue is root-caused.
+    private var appAudioBufferCount = 0
+    private var micAudioBufferCount = 0
+    private var appAudioByteTotal = 0
+    private var micAudioByteTotal = 0
+    private var micAudioAppendFailureCount = 0
+    private var loggedAppAudioFormat = false
+    private var loggedMicAudioFormat = false
+
+    private func sampleByteLength(_ sampleBuffer: CMSampleBuffer) -> Int {
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return 0 }
+        return CMBlockBufferGetDataLength(blockBuffer)
+    }
+
+    private func permissionDescription(_ permission: AVAudioSession.RecordPermission) -> String {
+        switch permission {
+        case .granted: return "granted"
+        case .denied: return "denied"
+        case .undetermined: return "undetermined"
+        @unknown default: return "unknown(\(permission.rawValue))"
+        }
+    }
+
+    private func logAudioFormatOnce(_ sampleBuffer: CMSampleBuffer, label: String, logged: inout Bool) {
+        guard !logged,
+              let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee
+        else { return }
+        logged = true
+        print("[flutter_screen_recording][diag] \(label) format: sampleRate=\(asbd.mSampleRate) channels=\(asbd.mChannelsPerFrame) bitsPerChannel=\(asbd.mBitsPerChannel) formatFlags=\(asbd.mFormatFlags)")
+    }
+
     public static func register(with registrar: FlutterPluginRegistrar) {
         let channel = FlutterMethodChannel(name: "flutter_screen_recording", binaryMessenger: registrar.messenger())
         let instance = SwiftFlutterScreenRecordingPlugin()
@@ -105,18 +140,38 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
             
             // Iniciar la captura con ReplayKit
             recorder.isMicrophoneEnabled = recordAudio
+            appAudioBufferCount = 0
+            micAudioBufferCount = 0
+            appAudioByteTotal = 0
+            micAudioByteTotal = 0
+            micAudioAppendFailureCount = 0
+            loggedAppAudioFormat = false
+            loggedMicAudioFormat = false
+            if recordAudio {
+                let session = AVAudioSession.sharedInstance()
+                print("[flutter_screen_recording][diag] starting capture: recordPermission=\(permissionDescription(session.recordPermission)) category=\(session.category.rawValue) isInputAvailable=\(session.isInputAvailable) isMicrophoneEnabled=\(recorder.isMicrophoneEnabled)")
+            }
             recorder.startCapture(handler: { [weak self] sampleBuffer, sampleBufferType, error in
                 guard let self = self, self.isRecording, error == nil else { return }
-                
+
                 switch sampleBufferType {
                 case .video:
                     self.handleVideoBuffer(sampleBuffer)
                 case .audioApp:
                     if recordAudio {
+                        self.logAudioFormatOnce(sampleBuffer, label: "audioApp", logged: &self.loggedAppAudioFormat)
+                        self.appAudioBufferCount += 1
+                        self.appAudioByteTotal += self.sampleByteLength(sampleBuffer)
                         self.handleAudioBuffer(sampleBuffer, input: self.appAudioWriterInput)
                     }
                 case .audioMic:
                     if recordAudio {
+                        self.logAudioFormatOnce(sampleBuffer, label: "audioMic", logged: &self.loggedMicAudioFormat)
+                        self.micAudioBufferCount += 1
+                        self.micAudioByteTotal += self.sampleByteLength(sampleBuffer)
+                        if self.micAudioBufferCount % 50 == 0 {
+                            print("[flutter_screen_recording][diag] mic buffers so far=\(self.micAudioBufferCount) bytes=\(self.micAudioByteTotal) appendFailures=\(self.micAudioAppendFailureCount)")
+                        }
                         self.handleAudioBuffer(sampleBuffer, input: self.micAudioWriterInput)
                     }
                 @unknown default:
@@ -158,10 +213,16 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
             // Each ReplayKit audio source has its own AVAssetWriter track. The
             // streams arrive independently and must not be appended to one
             // shared input as if they were a single chronological stream.
-            guard let writer = videoWriter, let input, sessionStarted else { return }
+            let isMicInput = input === micAudioWriterInput
+            guard let writer = videoWriter, let input, sessionStarted else {
+                if isMicInput { micAudioAppendFailureCount += 1 }
+                return
+            }
 
             if writer.status == .writing && input.isReadyForMoreMediaData {
                 input.append(sampleBuffer)
+            } else if isMicInput {
+                micAudioAppendFailureCount += 1
             }
         }
     }
@@ -173,10 +234,11 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
             return
         }
         isRecording = false
+        print("[flutter_screen_recording][diag] stopping capture: appAudioBuffers=\(appAudioBufferCount) bytes=\(appAudioByteTotal) | micAudioBuffers=\(micAudioBufferCount) bytes=\(micAudioByteTotal) micAppendFailures=\(micAudioAppendFailureCount)")
         if #available(iOS 11.0, *) {
             recorder.stopCapture { [weak self] error in
                 guard let self = self else { return }
-                
+
                 self.videoWriterInput?.markAsFinished()
                 self.appAudioWriterInput?.markAsFinished()
                 self.micAudioWriterInput?.markAsFinished()
