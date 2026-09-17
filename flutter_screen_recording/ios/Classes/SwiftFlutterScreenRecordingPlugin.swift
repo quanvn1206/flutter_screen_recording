@@ -320,13 +320,19 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
         let mixedURL = sourceURL.deletingLastPathComponent().appendingPathComponent("\(UUID().uuidString).mp4")
         exporter.outputURL = mixedURL
         exporter.outputFileType = .mp4
-        // Presence of an AVAudioMix (even with every track left at its
-        // default 1.0 volume) is what makes the exporter fold multiple
+        // Presence of an AVAudioMix is what makes the exporter fold multiple
         // simultaneous composition audio tracks down into the destination's
         // single audio track, instead of carrying them over as separate
-        // tracks the way a plain re-encode would.
+        // tracks the way a plain re-encode would. Volume is set explicitly
+        // (rather than left at whatever AVMutableAudioMixInputParameters
+        // defaults to) — an unset volume has been reported to render as
+        // silence on some iOS versions instead of the documented 1.0 default.
         let audioMix = AVMutableAudioMix()
-        audioMix.inputParameters = compositionAudioTracks.map { AVMutableAudioMixInputParameters(track: $0) }
+        audioMix.inputParameters = compositionAudioTracks.map { track in
+            let parameters = AVMutableAudioMixInputParameters(track: track)
+            parameters.setVolume(1.0, at: .zero)
+            return parameters
+        }
         exporter.audioMix = audioMix
 
         print("[flutter_screen_recording][diag] mixing \(compositionAudioTracks.count) audio tracks into one for playback compatibility")
@@ -339,6 +345,8 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                 result(sourceURL.path)
                 return
             }
+            let mixedAudioTrackCount = AVURLAsset(url: mixedURL).tracks(withMediaType: .audio).count
+            print("[flutter_screen_recording][diag] mix export completed: outputAudioTracks=\(mixedAudioTrackCount) (expected 1)")
             do {
                 // `replaceItemAt` swaps the file in place — unlike a
                 // separate remove-then-move, it never leaves `sourceURL`
