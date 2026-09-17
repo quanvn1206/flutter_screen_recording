@@ -98,6 +98,16 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
     /// host apps cannot accidentally leave the recorder on an output-only
     /// route. In particular, do not request Bluetooth A2DP here: it has no
     /// microphone input; `.allowBluetooth` chooses two-way HFP instead.
+    ///
+    /// Mode is `.voiceChat`, not `.videoRecording`: the mic was confirmed
+    /// (diagnostics: peak amplitude ~30000/32767, a real voice) to be
+    /// capturing correctly, but what it captured also included the app's
+    /// own narration/SFX bleeding acoustically from the speaker into the
+    /// mic — loud, since they're on the same device — drowning out the
+    /// player's voice. `.videoRecording` mode captures ambient sound
+    /// as-is; `.voiceChat` engages iOS's built-in acoustic echo
+    /// cancellation, which is designed for exactly this "device plays
+    /// audio out loud while also recording via its own mic" situation.
     private func prepareMicrophoneAudioSession() throws {
         let session = AVAudioSession.sharedInstance()
         guard session.recordPermission == .granted else {
@@ -109,7 +119,7 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
         }
         try session.setCategory(
             .playAndRecord,
-            mode: .videoRecording,
+            mode: .voiceChat,
             options: [.allowBluetooth]
         )
         try session.setActive(true, options: [])
