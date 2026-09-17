@@ -4,11 +4,10 @@ import ReplayKit
 import AVFoundation
 
 public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
-    
+
     let recorder = RPScreenRecorder.shared()
     var videoWriter: AVAssetWriter?
     var videoWriterInput: AVAssetWriterInput?
-    var appAudioWriterInput: AVAssetWriterInput?
     var micAudioWriterInput: AVAssetWriterInput?
     var videoOutputURL: URL?
     var isRecording = false
@@ -27,24 +26,18 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
     private let writerQueue = DispatchQueue(label: "com.flutter_screen_recording.writer")
     private var sessionStarted = false
 
-    // TEMPORARY diagnostics for the "no mic audio" investigation. Printed
-    // via `print()` so it shows up directly in `flutter run`'s console — no
-    // Xcode attach needed. Safe to leave in (cheap counters, no behavior
-    // change); remove once the mic issue is root-caused.
-    private var appAudioBufferCount = 0
+    // Diagnostics kept from the mic-audio investigation: cheap, read-only,
+    // and useful for confirming mic capture is healthy on any future report.
     private var micAudioBufferCount = 0
-    private var appAudioByteTotal = 0
     private var micAudioByteTotal = 0
     private var micAudioAppendFailureCount = 0
-    private var loggedAppAudioFormat = false
     private var loggedMicAudioFormat = false
     // Peak absolute sample value seen on the mic track this recording.
     // Buffer/byte counts alone can't tell real audio apart from well-formed
     // silence (silence still produces identically-sized buffers) — this is
-    // the read-only check for that. 0 means the hardware delivered silence
-    // (a mic/OS-level problem, e.g. a conflict with the camera pipeline also
-    // claiming the microphone); a normal talking voice should peak well into
-    // the thousands (Int16 range is ±32767).
+    // the read-only check for that. 0 means the hardware delivered silence;
+    // a normal talking voice should peak well into the thousands (Int16
+    // range is ±32767).
     private var micPeakAmplitude: Int16 = 0
 
     private func sampleByteLength(_ sampleBuffer: CMSampleBuffer) -> Int {
@@ -53,10 +46,11 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
     }
 
     // Read-only — never mutates the buffer, so this cannot introduce the
-    // kind of corruption the earlier in-place gain-scaling attempt did.
-    // Assumes native-endian, packed Int16 mono, matching the confirmed
-    // audioMic format (formatFlags=12 → signedInteger+packed, no float, no
-    // big-endian bit). Silently no-ops for any other format.
+    // kind of corruption an earlier gain-scaling attempt did (see git
+    // history: raw PCM buffer mutation caused audible static and was
+    // reverted). Assumes native-endian, packed Int16 mono, matching the
+    // confirmed audioMic format (formatFlags=12 → signedInteger+packed, no
+    // float, no big-endian bit). Silently no-ops for any other format.
     private func updateMicPeakAmplitude(_ sampleBuffer: CMSampleBuffer) {
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDescription)?.pointee,
@@ -99,6 +93,28 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
         }
     }
 
+    /// ReplayKit's `.audioMic` stream depends on the process-wide audio
+    /// session at the instant capture starts. Own that setup in the plugin so
+    /// host apps cannot accidentally leave the recorder on an output-only
+    /// route. In particular, do not request Bluetooth A2DP here: it has no
+    /// microphone input; `.allowBluetooth` chooses two-way HFP instead.
+    private func prepareMicrophoneAudioSession() throws {
+        let session = AVAudioSession.sharedInstance()
+        guard session.recordPermission == .granted else {
+            throw NSError(
+                domain: "flutter_screen_recording",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Microphone permission is not granted"]
+            )
+        }
+        try session.setCategory(
+            .playAndRecord,
+            mode: .videoRecording,
+            options: [.allowBluetooth]
+        )
+        try session.setActive(true, options: [])
+    }
+
     private func logAudioFormatOnce(_ sampleBuffer: CMSampleBuffer, label: String, logged: inout Bool) {
         guard !logged,
               let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer),
@@ -130,34 +146,45 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
             result(FlutterMethodNotImplemented)
         }
     }
-    
+
     func startRecording(videoName: String, recordAudio: Bool, result: @escaping FlutterResult) {
         guard !isRecording else {
             result(FlutterError(code: "ALREADY_RECORDING", message: "Recording is already in progress", details: nil))
             return
         }
-        
+
         isRecording = true
         writerQueue.sync { sessionStarted = false }
+
+        if recordAudio {
+            do {
+                try prepareMicrophoneAudioSession()
+            } catch {
+                isRecording = false
+                result(FlutterError(code: "MICROPHONE_UNAVAILABLE", message: "Unable to prepare the microphone for screen recording", details: error.localizedDescription))
+                return
+            }
+        }
 
         // Configurar la ruta del archivo de video
         let documentsPath = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true)[0]
         videoOutputURL = URL(fileURLWithPath: documentsPath).appendingPathComponent("\(videoName).mp4")
-        
+
         // Eliminar el archivo si ya existe
         if FileManager.default.fileExists(atPath: videoOutputURL!.path) {
             try? FileManager.default.removeItem(at: videoOutputURL!)
         }
-        
+
         if #available(iOS 11.0, *) {
             // Crear el AVAssetWriter
             do {
                 videoWriter = try AVAssetWriter(outputURL: videoOutputURL!, fileType: .mp4)
             } catch {
+                isRecording = false
                 result(FlutterError(code: "FILE_ERROR", message: "Unable to create video file", details: error.localizedDescription))
                 return
             }
-            
+
             // Configurar la entrada de video
             let videoSettings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
@@ -167,31 +194,33 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
             videoWriterInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
             videoWriterInput?.expectsMediaDataInRealTime = true
             videoWriter?.add(videoWriterInput!)
-            
-            // Configurar la entrada de audio si es necesario
+
+            // Configurar la entrada de audio si es necesario. Mic-only: an
+            // earlier version also captured ReplayKit's `.audioApp` stream as
+            // a second track (to include narration/SFX in the recording),
+            // but no combination of two-track playback, raw PCM gain
+            // scaling, or an AVFoundation-driven single-track mixdown made
+            // the mic audible in the resulting file — despite on-device
+            // diagnostics proving ReplayKit captured real, loud mic audio
+            // (peak amplitude ~30000/32767) at every step. Back to the
+            // simple, previously-working shape: one writer input, fed only
+            // by `.audioMic`.
             if recordAudio {
                 let audioSettings: [String: Any] = [
                     AVFormatIDKey: kAudioFormatMPEG4AAC,
                     AVSampleRateKey: 44100,
                     AVNumberOfChannelsKey: 2
                 ]
-                appAudioWriterInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-                appAudioWriterInput?.expectsMediaDataInRealTime = true
-                videoWriter?.add(appAudioWriterInput!)
-
                 micAudioWriterInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
                 micAudioWriterInput?.expectsMediaDataInRealTime = true
                 videoWriter?.add(micAudioWriterInput!)
             }
-            
+
             // Iniciar la captura con ReplayKit
             recorder.isMicrophoneEnabled = recordAudio
-            appAudioBufferCount = 0
             micAudioBufferCount = 0
-            appAudioByteTotal = 0
             micAudioByteTotal = 0
             micAudioAppendFailureCount = 0
-            loggedAppAudioFormat = false
             loggedMicAudioFormat = false
             micPeakAmplitude = 0
             if recordAudio {
@@ -205,12 +234,8 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                 case .video:
                     self.handleVideoBuffer(sampleBuffer)
                 case .audioApp:
-                    if recordAudio {
-                        self.logAudioFormatOnce(sampleBuffer, label: "audioApp", logged: &self.loggedAppAudioFormat)
-                        self.appAudioBufferCount += 1
-                        self.appAudioByteTotal += self.sampleByteLength(sampleBuffer)
-                        self.handleAudioBuffer(sampleBuffer, input: self.appAudioWriterInput)
-                    }
+                    // Not recorded — see the comment above `micAudioWriterInput`.
+                    break
                 case .audioMic:
                     if recordAudio {
                         self.logAudioFormatOnce(sampleBuffer, label: "audioMic", logged: &self.loggedMicAudioFormat)
@@ -227,17 +252,18 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                 }
             }) { error in
                 if let error = error {
+                    self.isRecording = false
                     result(FlutterError(code: "CAPTURE_ERROR", message: "Failed to start screen recording", details: error.localizedDescription))
                 } else {
                     result(true)
                 }
             }
-        } 
+        }
         else {
             result(FlutterError(code: "IOS_VERSION_ERROR", message: "This feature is only available on iOS 11 or later", details: nil))
         }
     }
-    
+
     func handleVideoBuffer(_ sampleBuffer: CMSampleBuffer) {
         writerQueue.sync {
             // Añadir el video al archivo
@@ -258,23 +284,19 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
 
     func handleAudioBuffer(_ sampleBuffer: CMSampleBuffer, input: AVAssetWriterInput?) {
         writerQueue.sync {
-            // Each ReplayKit audio source has its own AVAssetWriter track. The
-            // streams arrive independently and must not be appended to one
-            // shared input as if they were a single chronological stream.
-            let isMicInput = input === micAudioWriterInput
             guard let writer = videoWriter, let input, sessionStarted else {
-                if isMicInput { micAudioAppendFailureCount += 1 }
+                micAudioAppendFailureCount += 1
                 return
             }
 
             if writer.status == .writing && input.isReadyForMoreMediaData {
                 input.append(sampleBuffer)
-            } else if isMicInput {
+            } else {
                 micAudioAppendFailureCount += 1
             }
         }
     }
-    
+
     func stopRecording(result: @escaping FlutterResult) {
         // Detener la captura con ReplayKit
         guard isRecording else {
@@ -282,13 +304,12 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
             return
         }
         isRecording = false
-        print("[flutter_screen_recording][diag] stopping capture: appAudioBuffers=\(appAudioBufferCount) bytes=\(appAudioByteTotal) | micAudioBuffers=\(micAudioBufferCount) bytes=\(micAudioByteTotal) micAppendFailures=\(micAudioAppendFailureCount) | micPeakAmplitude=\(micPeakAmplitude) (0=silence, ~1000s+=real speech)")
+        print("[flutter_screen_recording][diag] stopping capture: micAudioBuffers=\(micAudioBufferCount) bytes=\(micAudioByteTotal) micAppendFailures=\(micAudioAppendFailureCount) micPeakAmplitude=\(micPeakAmplitude) (0=silence, ~1000s+=real speech)")
         if #available(iOS 11.0, *) {
             recorder.stopCapture { [weak self] error in
                 guard let self = self else { return }
 
                 self.videoWriterInput?.markAsFinished()
-                self.appAudioWriterInput?.markAsFinished()
                 self.micAudioWriterInput?.markAsFinished()
                 self.videoWriter?.finishWriting {
                     if let error = error {
@@ -300,113 +321,13 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                         // touches UIKit off the main thread and trips the Main Thread
                         // Checker: "Modifying properties of a view's layer off the main
                         // thread is not allowed." Just removed — nothing used the alert.
-                        self.exportMixedRecording(result: result)
+                        result(self.videoOutputURL?.path)
                     }
                 }
             }
         }
         else {
             result(FlutterError(code: "IOS_VERSION_ERROR", message: "This feature is only available on iOS 11 or later", details: nil))
-        }
-    }
-
-    /// ReplayKit delivers the app-audio and mic-audio streams as two
-    /// independent tracks (see `startRecording`), and the on-device
-    /// diagnostics confirm both are captured correctly. But several MP4
-    /// players — including the one this app uses for in-app playback —
-    /// only render a single audio track from a multi-track file, which made
-    /// the (perfectly recorded) mic track appear to be missing. This merges
-    /// both tracks into the single audio track a normal video file has,
-    /// using AVFoundation's own decode/mix/encode pipeline rather than
-    /// touching raw PCM bytes (that direct-buffer approach previously
-    /// introduced audible static — see the reverted gain-scaling commit).
-    private func exportMixedRecording(result: @escaping FlutterResult) {
-        guard let sourceURL = videoOutputURL else {
-            result(FlutterError(code: "FILE_ERROR", message: "Recording output file is unavailable", details: nil))
-            return
-        }
-
-        let sourceAsset = AVURLAsset(url: sourceURL)
-        let sourceAudioTracks = sourceAsset.tracks(withMediaType: .audio)
-        guard sourceAudioTracks.count > 1, let sourceVideoTrack = sourceAsset.tracks(withMediaType: .video).first else {
-            // Nothing to mix (audio disabled, or only one track already) —
-            // the file is already in its final, playable form.
-            result(sourceURL.path)
-            return
-        }
-
-        let composition = AVMutableComposition()
-        guard let compositionVideoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
-            result(FlutterError(code: "EXPORT_ERROR", message: "Recording video track is unavailable", details: nil))
-            return
-        }
-
-        var compositionAudioTracks: [AVMutableCompositionTrack] = []
-        do {
-            let videoRange = CMTimeRange(start: .zero, duration: sourceAsset.duration)
-            try compositionVideoTrack.insertTimeRange(videoRange, of: sourceVideoTrack, at: .zero)
-
-            for sourceAudioTrack in sourceAudioTracks {
-                guard let compositionAudioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
-                    continue
-                }
-                let audioRange = CMTimeRange(start: .zero, duration: sourceAudioTrack.timeRange.duration)
-                try compositionAudioTrack.insertTimeRange(audioRange, of: sourceAudioTrack, at: .zero)
-                compositionAudioTracks.append(compositionAudioTrack)
-            }
-        } catch {
-            print("[flutter_screen_recording][diag] failed to build mix composition: \(error.localizedDescription) — keeping the unmixed recording")
-            result(sourceURL.path)
-            return
-        }
-
-        guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
-            result(sourceURL.path)
-            return
-        }
-
-        let mixedURL = sourceURL.deletingLastPathComponent().appendingPathComponent("\(UUID().uuidString).mp4")
-        exporter.outputURL = mixedURL
-        exporter.outputFileType = .mp4
-        // Presence of an AVAudioMix is what makes the exporter fold multiple
-        // simultaneous composition audio tracks down into the destination's
-        // single audio track, instead of carrying them over as separate
-        // tracks the way a plain re-encode would. Volume is set explicitly
-        // (rather than left at whatever AVMutableAudioMixInputParameters
-        // defaults to) — an unset volume has been reported to render as
-        // silence on some iOS versions instead of the documented 1.0 default.
-        let audioMix = AVMutableAudioMix()
-        audioMix.inputParameters = compositionAudioTracks.map { track in
-            let parameters = AVMutableAudioMixInputParameters(track: track)
-            parameters.setVolume(1.0, at: .zero)
-            return parameters
-        }
-        exporter.audioMix = audioMix
-
-        print("[flutter_screen_recording][diag] mixing \(compositionAudioTracks.count) audio tracks into one for playback compatibility")
-
-        exporter.exportAsynchronously { [weak self] in
-            guard let self = self else { return }
-            guard exporter.status == .completed else {
-                print("[flutter_screen_recording][diag] audio mix export failed: status=\(exporter.status.rawValue) error=\(String(describing: exporter.error)) — keeping the unmixed recording")
-                try? FileManager.default.removeItem(at: mixedURL)
-                result(sourceURL.path)
-                return
-            }
-            let mixedAudioTrackCount = AVURLAsset(url: mixedURL).tracks(withMediaType: .audio).count
-            print("[flutter_screen_recording][diag] mix export completed: outputAudioTracks=\(mixedAudioTrackCount) (expected 1)")
-            do {
-                // `replaceItemAt` swaps the file in place — unlike a
-                // separate remove-then-move, it never leaves `sourceURL`
-                // deleted with nothing to replace it if the second step
-                // were to fail.
-                _ = try FileManager.default.replaceItemAt(sourceURL, withItemAt: mixedURL)
-                result(sourceURL.path)
-            } catch {
-                print("[flutter_screen_recording][diag] failed to swap in the mixed recording: \(error.localizedDescription) — keeping the unmixed recording")
-                try? FileManager.default.removeItem(at: mixedURL)
-                result(sourceURL.path)
-            }
         }
     }
 }
