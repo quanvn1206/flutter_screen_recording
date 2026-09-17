@@ -58,7 +58,7 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
               asbd.mFormatFlags & kAudioFormatFlagIsFloat == 0,
               asbd.mBitsPerChannel == 16,
               let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer),
-              CMBlockBufferIsRangeContiguous(blockBuffer, 0, 0)
+              CMBlockBufferIsRangeContiguous(blockBuffer, atOffset: 0, length: 0)
         else { return }
 
         var lengthAtOffset = 0
@@ -66,10 +66,10 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
         var dataPointer: UnsafeMutablePointer<Int8>?
         let status = CMBlockBufferGetDataPointer(
             blockBuffer,
-            0,
-            &lengthAtOffset,
-            &totalLength,
-            &dataPointer
+            atOffset: 0,
+            lengthAtOffsetOut: &lengthAtOffset,
+            totalLengthOut: &totalLength,
+            dataPointerOut: &dataPointer
         )
         guard status == kCMBlockBufferNoErr, let dataPointer else { return }
 
@@ -84,7 +84,7 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
         }
     }
 
-    private func permissionDescription(_ permission: AVAudioSessionRecordPermission) -> String {
+    private func permissionDescription(_ permission: AVAudioSession.RecordPermission) -> String {
         switch permission {
         case .granted: return "granted"
         case .denied: return "denied"
@@ -110,7 +110,7 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
     /// audio out loud while also recording via its own mic" situation.
     private func prepareMicrophoneAudioSession() throws {
         let session = AVAudioSession.sharedInstance()
-        guard session.recordPermission() == .granted else {
+        guard session.recordPermission == .granted else {
             throw NSError(
                 domain: "flutter_screen_recording",
                 code: 1,
@@ -118,13 +118,13 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
             )
         }
         try session.setCategory(
-            "AVAudioSessionCategoryPlayAndRecord",
+            AVAudioSession.Category.playAndRecord,
             // `.voiceChat` mode alone routes output to the quiet earpiece
             // receiver by default (phone-call-style), not the main speaker —
             // `.defaultToSpeaker` overrides that so the app's own audio
             // stays audible on the loudspeaker while the mic still gets
             // echo cancellation.
-            mode: "AVAudioSessionModeVoiceChat",
+            mode: AVAudioSession.Mode.voiceChat,
             options: [
                 AVAudioSession.CategoryOptions.allowBluetooth,
                 AVAudioSession.CategoryOptions.defaultToSpeaker,
@@ -243,7 +243,7 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
             micPeakAmplitude = 0
             if recordAudio {
                 let session = AVAudioSession.sharedInstance()
-                print("[flutter_screen_recording][diag] starting capture: recordPermission=\(permissionDescription(session.recordPermission())) category=\(session.category) isInputAvailable=\(session.isInputAvailable) isMicrophoneEnabled=\(recorder.isMicrophoneEnabled)")
+                print("[flutter_screen_recording][diag] starting capture: recordPermission=\(permissionDescription(session.recordPermission)) category=\(session.category.rawValue) isInputAvailable=\(session.isInputAvailable) isMicrophoneEnabled=\(recorder.isMicrophoneEnabled)")
             }
             recorder.startCapture(handler: { [weak self] sampleBuffer, sampleBufferType, error in
                 guard let self = self, self.isRecording, error == nil else { return }
