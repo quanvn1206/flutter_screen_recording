@@ -252,13 +252,105 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                         // touches UIKit off the main thread and trips the Main Thread
                         // Checker: "Modifying properties of a view's layer off the main
                         // thread is not allowed." Just removed — nothing used the alert.
-                        result(self.videoOutputURL?.path)
+                        self.exportMixedRecording(result: result)
                     }
                 }
             }
         }
         else {
             result(FlutterError(code: "IOS_VERSION_ERROR", message: "This feature is only available on iOS 11 or later", details: nil))
+        }
+    }
+
+    /// ReplayKit delivers the app-audio and mic-audio streams as two
+    /// independent tracks (see `startRecording`), and the on-device
+    /// diagnostics confirm both are captured correctly. But several MP4
+    /// players — including the one this app uses for in-app playback —
+    /// only render a single audio track from a multi-track file, which made
+    /// the (perfectly recorded) mic track appear to be missing. This merges
+    /// both tracks into the single audio track a normal video file has,
+    /// using AVFoundation's own decode/mix/encode pipeline rather than
+    /// touching raw PCM bytes (that direct-buffer approach previously
+    /// introduced audible static — see the reverted gain-scaling commit).
+    private func exportMixedRecording(result: @escaping FlutterResult) {
+        guard let sourceURL = videoOutputURL else {
+            result(FlutterError(code: "FILE_ERROR", message: "Recording output file is unavailable", details: nil))
+            return
+        }
+
+        let sourceAsset = AVURLAsset(url: sourceURL)
+        let sourceAudioTracks = sourceAsset.tracks(withMediaType: .audio)
+        guard sourceAudioTracks.count > 1, let sourceVideoTrack = sourceAsset.tracks(withMediaType: .video).first else {
+            // Nothing to mix (audio disabled, or only one track already) —
+            // the file is already in its final, playable form.
+            result(sourceURL.path)
+            return
+        }
+
+        let composition = AVMutableComposition()
+        guard let compositionVideoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            result(FlutterError(code: "EXPORT_ERROR", message: "Recording video track is unavailable", details: nil))
+            return
+        }
+
+        var compositionAudioTracks: [AVMutableCompositionTrack] = []
+        do {
+            let videoRange = CMTimeRange(start: .zero, duration: sourceAsset.duration)
+            try compositionVideoTrack.insertTimeRange(videoRange, of: sourceVideoTrack, at: .zero)
+
+            for sourceAudioTrack in sourceAudioTracks {
+                guard let compositionAudioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else {
+                    continue
+                }
+                let audioRange = CMTimeRange(start: .zero, duration: sourceAudioTrack.timeRange.duration)
+                try compositionAudioTrack.insertTimeRange(audioRange, of: sourceAudioTrack, at: .zero)
+                compositionAudioTracks.append(compositionAudioTrack)
+            }
+        } catch {
+            print("[flutter_screen_recording][diag] failed to build mix composition: \(error.localizedDescription) — keeping the unmixed recording")
+            result(sourceURL.path)
+            return
+        }
+
+        guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
+            result(sourceURL.path)
+            return
+        }
+
+        let mixedURL = sourceURL.deletingLastPathComponent().appendingPathComponent("\(UUID().uuidString).mp4")
+        exporter.outputURL = mixedURL
+        exporter.outputFileType = .mp4
+        // Presence of an AVAudioMix (even with every track left at its
+        // default 1.0 volume) is what makes the exporter fold multiple
+        // simultaneous composition audio tracks down into the destination's
+        // single audio track, instead of carrying them over as separate
+        // tracks the way a plain re-encode would.
+        let audioMix = AVMutableAudioMix()
+        audioMix.inputParameters = compositionAudioTracks.map { AVMutableAudioMixInputParameters(track: $0) }
+        exporter.audioMix = audioMix
+
+        print("[flutter_screen_recording][diag] mixing \(compositionAudioTracks.count) audio tracks into one for playback compatibility")
+
+        exporter.exportAsynchronously { [weak self] in
+            guard let self = self else { return }
+            guard exporter.status == .completed else {
+                print("[flutter_screen_recording][diag] audio mix export failed: status=\(exporter.status.rawValue) error=\(String(describing: exporter.error)) — keeping the unmixed recording")
+                try? FileManager.default.removeItem(at: mixedURL)
+                result(sourceURL.path)
+                return
+            }
+            do {
+                // `replaceItemAt` swaps the file in place — unlike a
+                // separate remove-then-move, it never leaves `sourceURL`
+                // deleted with nothing to replace it if the second step
+                // were to fail.
+                _ = try FileManager.default.replaceItemAt(sourceURL, withItemAt: mixedURL)
+                result(sourceURL.path)
+            } catch {
+                print("[flutter_screen_recording][diag] failed to swap in the mixed recording: \(error.localizedDescription) — keeping the unmixed recording")
+                try? FileManager.default.removeItem(at: mixedURL)
+                result(sourceURL.path)
+            }
         }
     }
 }
