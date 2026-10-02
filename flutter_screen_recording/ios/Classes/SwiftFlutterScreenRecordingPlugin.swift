@@ -217,11 +217,33 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                 return
             }
 
-            // Configurar la entrada de video
+            // Configurar la entrada de video.
+            //
+            // `screenSize` (UIScreen.main.bounds) is in points, but the
+            // CMSampleBuffers ReplayKit hands to startCapture's handler are
+            // native-resolution pixel buffers (points × UIScreen.main.scale,
+            // e.g. 3x on most modern iPhones). Without multiplying by scale
+            // here, AVVideoWidthKey/HeightKey told the encoder to downscale
+            // every frame to 1/3 (or 1/2) of the real capture resolution —
+            // the recorded video was genuinely low-res, not just compressed,
+            // which is why it looked blurry even full-screen on the same
+            // device it was recorded on.
+            let scale = UIScreen.main.scale
+            let videoWidth = screenSize.width * scale
+            let videoHeight = screenSize.height * scale
+            // Mirrors the Android implementation's bits-per-pixel heuristic
+            // (`5 * width * height`, see FlutterScreenRecordingPlugin.kt) so
+            // both platforms target comparably sharp output. Capped so very
+            // large panels (e.g. iPad) don't produce absurd bitrates/files.
+            let averageBitRate = min(Int(videoWidth * videoHeight * 5), 20_000_000)
             let videoSettings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: screenSize.width,
-                AVVideoHeightKey: screenSize.height
+                AVVideoWidthKey: videoWidth,
+                AVVideoHeightKey: videoHeight,
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: averageBitRate,
+                    AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+                ]
             ]
             videoWriterInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
             videoWriterInput?.expectsMediaDataInRealTime = true
@@ -241,7 +263,12 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
                 let audioSettings: [String: Any] = [
                     AVFormatIDKey: kAudioFormatMPEG4AAC,
                     AVSampleRateKey: 44100,
-                    AVNumberOfChannelsKey: 2
+                    AVNumberOfChannelsKey: 2,
+                    // Without an explicit bitrate the AAC encoder picked its
+                    // own (lower) default, which can sound muffled/unclear
+                    // on top of the mic already being quiet. 128kbps is a
+                    // standard "clear voice" stereo AAC target.
+                    AVEncoderBitRateKey: 128_000
                 ]
                 micAudioWriterInput = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
                 micAudioWriterInput?.expectsMediaDataInRealTime = true

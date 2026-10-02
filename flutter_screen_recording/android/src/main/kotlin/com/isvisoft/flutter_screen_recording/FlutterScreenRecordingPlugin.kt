@@ -266,6 +266,13 @@ class FlutterScreenRecordingPlugin :
                 mMediaRecorder?.setAudioSource(MediaRecorder.AudioSource.MIC);
                 mMediaRecorder?.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
                 mMediaRecorder?.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+                // Without these, MediaRecorder falls back to a
+                // device-dependent (often very low, sometimes mono/8kHz-ish)
+                // default AAC bitrate/sample rate, which is why mic audio
+                // came out quiet and unclear. 128kbps/44.1kHz matches the
+                // iOS side's explicit AAC settings.
+                mMediaRecorder?.setAudioEncodingBitRate(128_000);
+                mMediaRecorder?.setAudioSamplingRate(44100);
             } else {
                 mMediaRecorder?.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
             }
