@@ -113,15 +113,18 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
     /// route. In particular, do not request Bluetooth A2DP here: it has no
     /// microphone input; `.allowBluetooth` chooses two-way HFP instead.
     ///
-    /// Mode is `.voiceChat`, not `.videoRecording`: the mic was confirmed
-    /// (diagnostics: peak amplitude ~30000/32767, a real voice) to be
-    /// capturing correctly, but what it captured also included the app's
-    /// own narration/SFX bleeding acoustically from the speaker into the
-    /// mic — loud, since they're on the same device — drowning out the
-    /// player's voice. `.videoRecording` mode captures ambient sound
-    /// as-is; `.voiceChat` engages iOS's built-in acoustic echo
-    /// cancellation, which is designed for exactly this "device plays
-    /// audio out loud while also recording via its own mic" situation.
+    /// Mode is `.default`, not `.voiceChat`. `.voiceChat` was tried to
+    /// engage iOS's acoustic echo cancellation (stop the app's own
+    /// narration/SFX bleeding acoustically from the speaker into the mic),
+    /// but on-device feedback was that app audio in the recording still
+    /// sounded clear while the player's own voice did not — the opposite of
+    /// what AEC should do — pointing at `.voiceChat`'s telephony-tuned DSP
+    /// (noise suppression + AEC) degrading voice clarity rather than fixing
+    /// it. Back to `.default` (plain capture, no AEC/noise suppression) to
+    /// A/B test that. Known trade-off if this is kept: app narration can
+    /// bleed into the mic acoustically again, same as before `.voiceChat`
+    /// was introduced. Keep this in sync with AudioSessionBridge
+    /// (ios/Runner/AppDelegate.swift in the host app) if either changes.
     private func prepareMicrophoneAudioSession() throws {
         let session = AVAudioSession.sharedInstance()
         guard session.recordPermission == .granted else {
@@ -133,12 +136,9 @@ public class SwiftFlutterScreenRecordingPlugin: NSObject, FlutterPlugin {
         }
         try session.setCategory(
             AVAudioSession.Category.playAndRecord,
-            // `.voiceChat` mode alone routes output to the quiet earpiece
-            // receiver by default (phone-call-style), not the main speaker —
-            // `.defaultToSpeaker` overrides that so the app's own audio
-            // stays audible on the loudspeaker while the mic still gets
-            // echo cancellation.
-            mode: AVAudioSession.Mode.voiceChat,
+            // `.defaultToSpeaker` keeps the app's own audio on the main
+            // speaker (not the quiet earpiece receiver) regardless of mode.
+            mode: AVAudioSession.Mode.default,
             options: [
                 AVAudioSession.CategoryOptions.allowBluetooth,
                 AVAudioSession.CategoryOptions.defaultToSpeaker,
