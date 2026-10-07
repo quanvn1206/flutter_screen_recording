@@ -9,6 +9,7 @@ import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaRecorder
 import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Environment
@@ -166,7 +167,18 @@ class FlutterScreenRecordingPlugin :
                     videoName = call.argument<String?>("name")
                     recordAudio = call.argument<Boolean?>("audio")
 
-                    val permissionIntent = mProjectionManager.createScreenCaptureIntent()
+                    // Android 14+ defaults the consent dialog to "share one app /
+                    // entire screen", forcing users to hunt for this app in a
+                    // list. Pin capture to the default display so the dialog is a
+                    // single confirm step (pre-14 only offers full screen anyway).
+                    val permissionIntent =
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                            mProjectionManager.createScreenCaptureIntent(
+                                MediaProjectionConfig.createConfigForDefaultDisplay()
+                            )
+                        } else {
+                            mProjectionManager.createScreenCaptureIntent()
+                        }
                     ActivityCompat.startActivityForResult(
                         activityBinding!!.activity,
                         permissionIntent,
